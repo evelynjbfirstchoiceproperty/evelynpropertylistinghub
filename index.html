@@ -30,7 +30,9 @@ body.search-page #globalImportBtn{display:none!important}
 <div class="topbar" id="adminBar" style="display:none"><span class="admin-badge">🔐 ADMIN MODE</span><button class="btn" onclick="showCustomerView()">👤 Customer View</button><button class="btn light" onclick="showLeads()">📩 Customer Leads <span id="leadBadge"></span></button>
 <label id="globalImportBtn" class="btn">📊 Import Excel<input id="allFiles" type="file" accept=".xlsx,.xls" multiple hidden></label>
 <button class="btn light" onclick="setWhatsAppBackend()">⚙️ WhatsApp API</button><button class="btn" onclick="exportExcel()">📥 Export Excel</button>
-<button class="btn" onclick="backup()">💾 Backup</button>
+<button class="btn" onclick="backup()">💾 Backup</button><button class="btn" onclick="syncDatabaseToSupabase()">
+☁️ Sync Now
+</button>
 <label class="btn light">♻️ Restore<input id="restoreFile" type="file" accept=".json" hidden></label>
 <button class="btn danger" onclick="clearAll()">🗑️ Clear All</button><button class="btn light" onclick="changeAdminPassword()">🔑 Change Password</button><button class="btn" onclick="logoutAdmin()">🚪 Logout</button>
 </div>
@@ -66,18 +68,62 @@ function getStatus(p){let k=field(p,aliases.status);return k?p[k]:''}
 function compareReference(a,b){a=String(a??'').trim();b=String(b??'').trim();if(!a&&!b)return 0;if(!a)return 1;if(!b)return -1;let aa=a.match(/^(.*?)(\d+)$/),bb=b.match(/^(.*?)(\d+)$/);if(aa&&bb){let c=aa[1].localeCompare(bb[1],undefined,{numeric:true,sensitivity:'base'});if(c)return c;return Number(aa[2])-Number(bb[2])}return a.localeCompare(b,undefined,{numeric:true,sensitivity:'base'})}
 function sortListings(){Object.keys(database).forEach(c=>database[c].sort((a,b)=>compareReference(getRef(a),getRef(b))))}
 function saveLocal(){try{localStorage.setItem(KEY,JSON.stringify(database))}catch(e){memoryStore[KEY]=JSON.stringify(database)}}
-function supabaseRequest(path,options={}){return fetch(SUPABASE_URL+'/rest/v1/'+path,{...options,headers:{apikey:SUPABASE_KEY,Authorization:'Bearer '+SUPABASE_KEY,'Content-Type':'application/json',...(options.headers||{})}}).then(async res=>{if(!res.ok){let t=await res.text();throw new Error('Supabase '+res.status+': '+t)}let t=await res.text();return t?JSON.parse(t):null})}
+async function supabaseRequest(path,options={}){
+  const headers={
+    apikey:SUPABASE_KEY,
+    'Content-Type':'application/json',
+    ...(options.headers||{})
+  };
+
+  const res=await fetch(
+    SUPABASE_URL+'/rest/v1/'+path,
+    {
+      ...options,
+      headers
+    }
+  );
+
+  const text=await res.text();
+
+  if(!res.ok){
+    throw new Error(
+      'Supabase '+res.status+': '+text
+    );
+  }
+
+  return text ? JSON.parse(text) : null;
+}
 function normalizeTableValue(v){if(v===undefined||v===null)return null;if(typeof v==='number'||typeof v==='boolean')return v;return String(v)}
 let tableColumnsCache={};
 async function getTableColumns(table){
-  if(tableColumnsCache[table])return tableColumnsCache[table];
+
+  if(tableColumnsCache[table]?.length){
+    return tableColumnsCache[table];
+  }
+
   try{
-    const meta=await supabaseRequest('');
-    const def=meta?.definitions?.[table];
-    const cols=def?.properties?Object.keys(def.properties):[];
-    tableColumnsCache[table]=cols;
-    return cols;
-  }catch(e){tableColumnsCache[table]=[];return []}
+
+    const rows=await supabaseRequest(
+      table+'?select=*&limit=1'
+    );
+
+    if(Array.isArray(rows) && rows.length){
+
+      tableColumnsCache[table]=Object.keys(rows[0]);
+
+      return tableColumnsCache[table];
+    }
+
+  }catch(e){
+
+    console.warn(
+      'Unable to detect columns for '+table,
+      e
+    );
+
+  }
+
+  return [];
 }
 function normKey(x){return norm(x).replace(/[^a-z0-9]/g,'')}
 function findExcelValue(p,aliasesList){let k=Object.keys(p).find(x=>aliasesList.includes(norm(x)));return k?p[k]:undefined}
@@ -114,16 +160,160 @@ async function buildDbRow(c,p){
   return row;
 }
 async function syncCategoryToSupabase(c){
+
+  if(!SUPABASE_TABLES[c]){
+    throw new Error(
+      'Unknown Supabase category: '+c
+    );
+  }
+
   const table=SUPABASE_TABLES[c];
-  const rows=[];for(const p of database[c])rows.push(await buildDbRow(c,p));
-  if(!rows.length)return;
-  const hasRef=rows.some(r=>Object.keys(r).some(k=>['property_id','propertyid'].includes(normKey(k))));
-  const conflict=hasRef?'property_id':'id';
-  await supabaseRequest(table+'?on_conflict='+encodeURIComponent(conflict),{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify(rows)});
+
+  const rows=[];
+
+  for(const p of database[c]){
+
+    const row=await buildDbRow(c,p);
+
+    if(Object.keys(row).length){
+      rows.push(row);
+    }
+
+  }
+
+  if(!rows.length){
+    log('ℹ️ '+c.toUpperCase()+' has no data to sync.');
+    return;
+  }
+
+  /*
+   * Use property_id as the preferred unique key.
+   * If your table uses reference instead,
+   * change this to "reference".
+   */
+
+  let conflictColumn='property_id';
+
+  if(
+    !rows.some(
+      r=>Object.prototype.hasOwnProperty.call(
+        r,
+        'property_id'
+      )
+    )
+  ){
+    conflictColumn='reference';
+  }
+
+  try{
+
+    await supabaseRequest(
+      table+
+      '?on_conflict='+
+      encodeURIComponent(conflictColumn),
+      {
+        method:'POST',
+
+        headers:{
+          Prefer:
+            'resolution=merge-duplicates,return=minimal'
+        },
+
+        body:JSON.stringify(rows)
+      }
+    );
+
+    log(
+      '☁️ '+c.toUpperCase()+
+      ' synced to Supabase: '+
+      rows.length+
+      ' listings.'
+    );
+
+  }catch(error){
+
+    console.error(
+      'Supabase sync error:',
+      error
+    );
+
+    log(
+      '❌ '+c.toUpperCase()+
+      ' Supabase sync failed: '+
+      error.message
+    );
+
+    throw error;
+  }
 }
 async function syncDatabaseToSupabase(){
-  try{for(const c of Object.keys(database))await syncCategoryToSupabase(c);log('☁️ Supabase sync completed.');}
-  catch(e){console.error(e);log('⚠️ Supabase sync failed: '+e.message)}
+
+  if(!adminUnlocked){
+    openAdminLogin();
+    return;
+  }
+
+  const btn=document.querySelector(
+    'button[onclick="syncDatabaseToSupabase()"]'
+  );
+
+  if(btn){
+    btn.disabled=true;
+    btn.textContent='☁️ Syncing...';
+  }
+
+  try{
+
+    let total=0;
+
+    for(const c of [
+      'land',
+      'commercial',
+      'factory',
+      'house'
+    ]){
+
+      if(database[c].length){
+
+        await syncCategoryToSupabase(c);
+
+        total+=database[c].length;
+
+      }
+
+    }
+
+    log(
+      '✅ Supabase Sync Completed — '+
+      total+
+      ' listings.'
+    );
+
+    alert(
+      '✅ Supabase Sync Completed!\\n\\n'+
+      total+
+      ' listings synced.'
+    );
+
+  }catch(e){
+
+    console.error(e);
+
+    alert(
+      '❌ Supabase Sync Failed\\n\\n'+
+      e.message
+    );
+
+  }finally{
+
+    if(btn){
+
+      btn.disabled=false;
+      btn.textContent='☁️ Sync Now';
+
+    }
+
+  }
 }
 async function loadDatabaseFromSupabase(){
   const fresh={land:[],commercial:[],factory:[],house:[]};
